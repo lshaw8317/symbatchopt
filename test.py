@@ -145,13 +145,13 @@ class Optimizer:
             self.stepper=self.Nesterov
         elif self.method=='euler':
             self.stepper=self.Euler
-            # self.preprocessor =self.nesterov_pre
-            # self.postprocessor = self.nesterov_post
+        elif self.method=='aoboa':
+            self.stepper=self.AOBOA
         elif self.method=='heavyball':
             self.stepper=self.HeavyBall
-        # elif method.lower()=='ubu':
+        elif method.lower()=='ubu':
         #     self.beta= lambda h: (1./self.alpha(h)-1.)/self.gamma
-        #     self.stepper=self.UBU
+            self.stepper=self.UBU
         #     self.preprocessor =self.ubu_pre
         #     self.postprocessor = self.ubu_post
         else:
@@ -198,15 +198,38 @@ class Optimizer:
     #     x-=(1.-torch.sqrt(self.alpha(h)))/self.gamma*v
     #     return x,v
     
-    def HeavyBall(self,x,v,h): 
+    def AOBOA(self,x,v,h): 
         '''
-        Symmetric
+        Symmetric: AOBOA
         '''
         x+=h*v/2
         g=self.loss.stochgrad(x)
+        v*=self.alpha(h/2)
+        v-=h*g
+        v*=self.alpha(h/2)
+        x+=h*v/2
+        return x,v
+    
+    def HeavyBall(self,x,v,h): 
+        '''
+        Not Symmetric: ABO
+        '''
+        g=self.loss.stochgrad(x)
         v*=self.alpha(h)
         v-=h*g
-        x+=h*v/2
+        x+=h*v
+        return x,v
+    
+    def UBU(self,x,v,h): 
+        '''
+        Symmetric: UBU
+        '''
+        x+=(1-self.alpha(h/2))*v/self.gamma
+        v*=self.alpha(h/2)
+        g=self.loss.stochgrad(x)
+        v-=h*g
+        x+=(1-self.alpha(h/2))*v/self.gamma
+        v*=self.alpha(h/2)
         return x,v
     
     def Euler(self,x,v,h): 
@@ -364,15 +387,19 @@ def plotBias(opt_dict,base=10):
     lines={'SMS':'--','RR':'-','RM':':','SO':'-.'}
     methods={'nesterov':'r','heavyball':'g','sgd':'b','euler':'c'}
     methodslist=list(opt_dict.keys())[3:]
-    for method in methodslist:
+    colorlist=['r','g','b','c']
+    for i,method in enumerate(methodslist):
         loc=opt_dict[method]
-        color=methods[method]
+        color=colorlist[i]
         plt.loglog([],[],color=color,base=base,ls='-',label=method)
         for strat in loc.keys():
             ls=lines[strat]
             x=torch.stack(loc[strat]).squeeze(1)
             err=torch.linalg.norm(x.squeeze(-1)-xopt[None,None],dim=(-1)).mean(dim=-1)
             plt.loglog(etarange,err,color=color,base=base,ls=ls)
+            a=np.vstack((np.log(etarange),np.ones(len(etarange)))).T
+            slope,_=np.linalg.lstsq(a,np.log(err.numpy()))[0]
+            print(f'Order of {method}-{strat} = {round(slope,2)}')
 
     for strat in loc.keys():   
         ls=lines[strat]
@@ -395,8 +422,9 @@ def plotDSS(opt_dict):
         for ls,strat in zip(['-','--',':'],loc.keys()):
             x=loc[strat]
             err=torch.linalg.norm(x.squeeze(-1)-xopt[None,None],dim=(-1)).mean(dim=-1)
-            plt.semilogy(np.arange(len(err))/K,err,color=color,base=2,ls=ls)
-
+            hrange=np.arange(len(err))/K
+            plt.semilogy(hrange,err,color=color,base=2,ls=ls)
+         
     for ls,strat in zip(['-','--',':'],loc.keys()):   
         plt.semilogy([],[],color='k',base=2,ls=ls,label=strat)
     
@@ -448,8 +476,10 @@ def getExp(expname,K,n_paths=100,exp='LogReg'):
             xnew=np.hstack((np.ones(shape=(N,1)),x))
             p_i=expit(torch.tensor(xnew@params))
             y=np.random.binomial(1, p_i).flatten() # output data
+            x=torch.tensor(x)
+            y=torch.tensor(y)
             with open("SimData.pkl", 'wb') as f:
-                pickle.dump({'x':torch.tensor(x),'y':torch.tensor(y),'params':params},f)
+                pickle.dump({'x':x,'y':y,'params':params},f)
     elif expname=='SimpleData':
         try:
             with open(datadir+"/SimpleData.pkl", 'rb') as f:
@@ -489,12 +519,12 @@ K=8
 loss=getExp(expname,K,exp=exp,n_paths=100)
 etarange = 2.**torch.arange(-13,-3)
 K=loss.mybatcher.K
-Niters=torch.tensor(np.maximum(10+.2/(etarange.numpy()),60)).to(torch.int32)
+Niters=torch.tensor(np.maximum(10+.1/(etarange.numpy()),60)).to(torch.int32)
 Niters+=1*Niters%2
 Niters*=K
 # Niters=50*K*torch.ones_like(etarange).to(torch.int32)
 strats=['RR','SMS','RM']
-methods=['heavyball','sgd','euler']
+methods=['heavyball','aoboa','UBU','euler']
 
 #Get Bias
 opt_dict={}
