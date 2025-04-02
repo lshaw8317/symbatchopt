@@ -1,9 +1,7 @@
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.preprocessing import StandardScaler
 import os
-from torch import sigmoid as expit
 from scipy.special import expit as npexpit
 import matplotlib.pyplot as plt
 import pickle
@@ -101,10 +99,22 @@ class MyBatcher:
         raise Exception('Sampling strategy not been defined!')
 
 class Loss:
-    def __init__(self,MAP,myb):
-        self.MAP=MAP
-        self.mybatcher=myb
-    
+    def __init__(self,data,K,n_paths,strat='RM',lam=None):
+        self.x, self.y = data
+        self.n = int(self.x.shape[0])
+        # Add dummy for bias
+        self.xnew = np.concatenate((self.x, np.ones((self.n, 1))), axis=1)
+        # self.xnew=self.x
+        if not lam:
+            self.lam = 0
+            L = self.smoothness()
+            self.lam = L / np.sqrt(self.n)
+        else:
+            self.lam=0
+        self.MAP = self.calc_MAP()
+        data_comb = np.concatenate((self.xnew, self.y[..., None]), axis=-1)
+        self.mybatcher = MyBatcher(data=data_comb, K=K, n_paths=n_paths, strat=strat)
+
     def set_strat(self,strat):
         if strat=='RR':
             self.mybatcher.set_strat('RR')
@@ -245,21 +255,8 @@ class Optimizer:
 
 class LogReg(Loss):
     def __init__(self,data,K,n_paths):
-        self.x,self.y=data
-        self.n=int(self.x.shape[0])
-        #Add dummy for bias
-        self.xnew=np.stack((self.x,np.ones((self.n,1))),dim=1)
-        I=np.eye(self.xnew.shape[1],dtype=self.xnew.dtype)
-        self.lam=0
-        L=self.smoothness()
-        self.lam=L/np.sqrt(self.n)
-        self.C=I/self.lam
-        self.Cinv=I*self.lam
+        super().__init__(data,K,n_paths)
 
-        MAP=self.calc_MAP()
-        data_comb=np.stack((self.xnew,self.y[...,None]),dim=-1)
-        mybatcher=MyBatcher(data=data_comb,K=K,n_paths=n_paths)
-        super().__init__(MAP,mybatcher)
     
     def smoothness(self):
         covariance = self.xnew.T@self.xnew/self.n
@@ -298,27 +295,19 @@ class LogReg(Loss):
         term=q*self.lam
         arg=self.xnew@q
         temp=(self.y-npexpit(arg))
-        return term-self.xnew.numpy().T@temp/self.n
+        return term-self.xnew.T@temp/self.n
     
     def grad(self,q,data):
        x,y=data[...,:-1],data[...,-1] #x has shape (n_paths,n,n_features)
-       term=torch.matmul(self.Cinv[None,...],q) #q has shape (n_paths,n_features,1)
-       arg=torch.matmul(x,q) #has shape (n_paths,n,1)
-       temp=y[...,None]-expit(arg) #has shape (n_paths,n,1)
+       term=q*self.lam #q has shape (n_paths,n_features,1)
+       arg=np.matmul(x,q) #has shape (n_paths,n,1)
+       temp=y[...,None]-npexpit(arg) #has shape (n_paths,n,1)
        bs=x.shape[1] #self.n divide term/self.mybatcher.K for true splitting scheme
-       return term-torch.matmul(x.permute(0,2,1),temp)/bs
+       return term-np.matmul(x.transpose(0,2,1),temp)/bs
 
 class LinReg(Loss):
     def __init__(self,data,K,n_paths,strat='RM'):
-        self.x,self.y=data
-        self.n=int(self.x.shape[0])
-        #Add dummy for bias
-        self.xnew=np.concatenate((self.x,np.ones((self.n,1))),axis=1)
-        # self.xnew=self.x
-        MAP=self.calc_MAP()
-        data_comb=np.concatenate((self.xnew,self.y[...,None]),axis=-1)
-        mybatcher=MyBatcher(data=data_comb,K=K,n_paths=n_paths,strat=strat)
-        super().__init__(MAP,mybatcher)
+        super().__init__(data,K,n_paths,strat='RM')
 
     def calc_MAP(self):
         return np.linalg.lstsq(self.xnew, self.y)[0]
@@ -347,14 +336,17 @@ def getbias(opt,h,Niters,polyak_average=False):
             s+=[temp[-1]]
         else:
             s+=[temp[2*K-1::2*K].mean(dim=0)]
-        err=np.linalg.norm(temp-q0[None,...],axis=(-1,-2)).mean(axis=-1)
+        err=np.linalg.norm(temp[2*K-1::2*K]-q0[None,...],axis=(-1,-2)).mean(axis=-1)
         plt.semilogy(err)
     plt.title(f'{opt.method}-{opt.strat}')
+    plt.savefig(f'ConvergenceCheck_{opt.method}_{opt.strat}.pdf',format='pdf')
+    plt.close()
     return s
 
 def getprogress(opt,h, Niters):
-    shape=tuple([opt.loss.mybatcher.n_paths]+[1 for i in opt.loss.MAP.shape])
-    q0=0.*opt.loss.MAP[None,...].repeat(shape).unsqueeze(-1)
+    #shape=tuple([opt.loss.mybatcher.n_paths]+[1 for i in opt.loss.MAP.shape])
+    #q0=0.*opt.loss.MAP[None,...].repeat(shape).unsqueeze(-1)
+    q0 = opt.loss.MAP[None,...,None].repeat(repeats=opt.loss.mybatcher.n_paths,axis=0)
     s=opt.run(q0, h, Niters=Niters,dss=True)
     return s
 
@@ -366,7 +358,7 @@ def plotBias(opt_dict,base=10):
     xopt=np.float64(opt_dict['xopt'])
     lines={'SMS':'--','RR':'-','RM':':','SO':'-.'}
     # methods={'nesterov':'r','heavyball':'g','sgd':'b','euler':'c'}
-    methodslist=list(opt_dict.keys())[3:]
+    methodslist=list(opt_dict.keys())[-3:]
     colorlist=['r','g','b','c']
     for i,method in enumerate(methodslist):
         loc=opt_dict[method]
@@ -388,7 +380,7 @@ def plotBias(opt_dict,base=10):
 
     plt.title(f'Bias: {exp} {expname}, $R={K}$')
     plt.xlabel('$h$')
-    plt.ylabel('$\|x-x_*\|$')
+    plt.ylabel('$\|x-X_*\|$')
     plt.legend()
     plt.savefig(os.path.join(figdir,f'Bias{exp}{expname}K{K}.pdf'),format='pdf',bbox_inches='tight')
 
@@ -397,21 +389,25 @@ def plotDSS(opt_dict):
     plt.figure(figsize=(3,2))
     K=opt_dict['K']
     xopt=opt_dict['xopt']
+    lines={'SMS':'--','RR':'-','RM':':','SO':'-.'}
     for color,method in zip(['r','g','b'],['nesterov','heavyball','sgd']):
         loc=opt_dict[method]
         plt.semilogy([],[],color=color,base=2,ls='-',label=method)
-        for ls,strat in zip(['-','--',':'],loc.keys()):
+        for strat in loc.keys():
             x=loc[strat]
-            err=torch.linalg.norm(x.squeeze(-1)-xopt[None,None],dim=(-1)).mean(dim=-1)
-            hrange=np.arange(len(err))/K
-            plt.semilogy(hrange,err,color=color,base=2,ls=ls)
+            ls=lines[strat]
+            err=np.linalg.norm(x.squeeze(-1)-xopt[None,None],axis=(-1)).mean(axis=-1)
+            timerange=np.arange(len(err))/K
+            newerr=np.min(err.reshape(-1,K),axis=1)
+            plt.semilogy(timerange[::K],newerr,color=color,base=2,ls=ls)
          
-    for ls,strat in zip(['-','--',':'],loc.keys()):   
+    for strat in loc.keys():
+        ls = lines[strat]
         plt.semilogy([],[],color='k',base=2,ls=ls,label=strat)
     
     plt.title(f'DSS: {exp} {expname}, $R={K}$')
     plt.xlabel('Epochs')
-    plt.ylabel('$\|x-x_*\|$')
+    plt.ylabel('$\|x-X_*\|$')
     plt.legend()
     plt.savefig(os.path.join(figdir,f'DSS{exp}{expname}K{K}.pdf'),format='pdf',bbox_inches='tight')
     
@@ -424,27 +420,27 @@ def getExp(expname,K,n_paths=100,exp='LogReg'):
         x = np.zeros_like(X,dtype=np.float64)
         for i in range(x.shape[-1]): 
             x[:,i] = pd.factorize(X.iloc[:,i],sort=True)[0]
-        x,y=torch.tensor(x),torch.tensor(y)
+        #x,y=torch.tensor(x),torch.tensor(y)
     elif expname=='StatLog':
         data = pd.read_table(datadir+'/satTrn.txt', header=None, sep=' ')
         X = np.array(data.iloc[:,:-1])
         x = StandardScaler().fit_transform(X)
         y = np.array(data.iloc[:,-1])
         y=np.where(y==2,1,0)
-        x,y=torch.tensor(x),torch.tensor(y)
+        #x,y=torch.tensor(x),torch.tensor(y)
     elif expname=='CTG':
         ctg = pd.read_table(datadir+'/CTG.txt',header=0)
         X = np.array(ctg.iloc[:,:21])
         x = StandardScaler().fit_transform(X)
         y = np.array(ctg.iloc[:,-1])
         y=np.where(y>2,1,0)
-        x,y=torch.tensor(x),torch.tensor(y)
+        #x,y=torch.tensor(x),torch.tensor(y)
     elif expname=='SimData':
         try:
             with open(datadir+"/SimData.pkl", 'rb') as f:
                 d=pickle.load(f)
-                x=torch.tensor(d['x'])
-                y=torch.tensor(d['y'])
+                x=d['x']
+                y=d['y']
         except:
             print('Generating simulated data for log reg experiment.')
             np.random.seed(2024)
@@ -455,10 +451,10 @@ def getExp(expname,K,n_paths=100,exp='LogReg'):
             params=np.random.normal(size=(p,))
             x=np.random.normal(size=(N,d),scale=scaler) #input data
             xnew=np.hstack((np.ones(shape=(N,1)),x))
-            p_i=expit(torch.tensor(xnew@params))
+            p_i=npexpit((xnew@params))
             y=np.random.binomial(1, p_i).flatten() # output data
-            x=torch.tensor(x)
-            y=torch.tensor(y)
+            #x=torch.tensor(x)
+            #y=torch.tensor(y)
             with open("SimData.pkl", 'wb') as f:
                 pickle.dump({'x':x,'y':y,'params':params},f)
     elif expname=='SimpleData':
@@ -469,18 +465,18 @@ def getExp(expname,K,n_paths=100,exp='LogReg'):
                 y=d['y']
         except:
             print('Generating simulated data for lin reg experiment.')
-            torch.manual_seed(2024)
+            np.random.seed(2024)
             # True parameters
             w_true = 2.0
             b_true = 0.1
             
             # Generate noisy dataset
-            x = torch.tensor([1, 2, 3, 4, 5], dtype=torch.float64)[...,None]
-            y = (w_true * x + b_true).flatten() + 0.2*torch.randn(size=(len(x),))
-
+            x = np.array([1, 2, 3, 4, 5], dtype=np.float64)[...,None]
+            y = (w_true * x + b_true).flatten() + 0.2*np.random.randn(len(x))
+    
             with open(datadir+"/SimpleData.pkl", 'wb') as f:
                 pickle.dump({'x':x,'y':y,'params':[b_true,w_true]},f)
-    
+
     else:
         raise ValueError('expname not valid: choose one of StatLog,Chess,CTG,SimData.')
     
@@ -494,24 +490,23 @@ def getExp(expname,K,n_paths=100,exp='LogReg'):
     return loss
 
 #%%
-exp='LinReg'
-expname='SimpleData'
-K=8
-loss=getExp(expname,K,exp=exp,n_paths=100)
-etarange = 2.**torch.arange(-18,-3,dtype=torch.float64).flip(dims=(0,)).numpy()
+exp='LogReg'
+expname='CTG'
+loss=getExp(expname,K=8,exp=exp,n_paths=100)
+etarange = 10.**np.arange(-3,0,step=0.5,dtype=np.float64)
 K=loss.mybatcher.K
-Niters=np.int32(np.maximum(10+.2/(etarange),60))
+Niters=np.int32(np.maximum(5/(etarange),500))
 Niters+=1*Niters%2
 Niters*=K
-# Niters=50*K*torch.ones_like(etarange).to(torch.int32)
 strats=['SMS','RR','RM']
-methods=['heavyball','aoboa','UBU','euler']
+methods=['heavyball','nesterov','sgd']
 
 #Get Bias
 opt_dict={}
 opt_dict['K']=K
 opt_dict['etarange']=etarange
 opt_dict['xopt']=loss.MAP
+opt_dict['experiment']=exp+expname
 for method in methods:
     methoddict={}
     for strat in strats:
@@ -520,25 +515,34 @@ for method in methods:
         methoddict[strat]=bias
     opt_dict[method]=methoddict
     
-# with open(resultsdir+f"/Bias{exp}{expname}_K{K}.pkl", 'wb') as f:
-#     pickle.dump(opt_dict,f)
-# with open(resultsdir+f"/Bias{exp}{expname}_K{K}.pkl", 'rb') as f:
-#     opt_dict=pickle.load(f)
+with open(resultsdir+f"/Bias{exp}{expname}_K{K}.pkl", 'wb') as f:
+     pickle.dump(opt_dict,f)
+with open(resultsdir+f"/Bias{exp}{expname}_K{K}.pkl", 'rb') as f:
+    opt_dict=pickle.load(f)
 plotBias(opt_dict)
-
+#%%
 #Get Progress with decreasing stepsize
+exp='LogReg'
+expname='StatLog'
+loss=getExp(expname,K=8,exp=exp,n_paths=100)
+K=loss.mybatcher.K
+strats=['SMS','RR','RM']
+methods=['heavyball','nesterov','sgd']
+factor={'CTG':4, 'SimData':3, 'Chess':7, 'StatLog':6}[expname]
 opt_dict={}
-opt_dict['K']=K
+K=loss.mybatcher.K
+opt_dict['K']= K
+opt_dict['experiment']=exp+expname
 l2=loss.smoothness()
-lr0 = torch.tensor(1 / l2)
+lr0 = 1 / l2
 opt_dict['lr0']=lr0
 opt_dict['xopt']=loss.MAP
 opt_dict['smoothness']=l2
-Niters=400*K
+Niters=1000*K
 for method in methods:
     methoddict={}
     for strat in strats:
-        opt=Optimizer(loss,method=method,lr_decay_coef=l2/K/3,strat=strat,it_start_decay=20*K)
+        opt=Optimizer(loss,method=method,lr_decay_coef=l2/K/factor,strat=strat,it_start_decay=20*K)
         prog=getprogress(opt,lr0,Niters) 
         methoddict[strat]=prog
     opt_dict[method]=methoddict
